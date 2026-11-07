@@ -80,6 +80,7 @@ Until step 2 passes, we shouldn't claim the system detects relaxation or attenti
 
 ```
 data/raw/2026-11-07/   original Unicorn Recorder exports (.csv + .bdf), 5 sessions × 2 recorders
+data/raw/2026-11-08/   pilot 00:07 (150 s): clean signal (~10 µV, 97% clean windows), 11 Hz alpha peak ~95-125 s
 data/merged/           all sessions of each recorder in ONE csv (zipped; columns: session_start, source_file, time_s, EEG 1-8, TRIG)
 recordings/            new recordings from stream_unicorn.py (not committed)
 ```
