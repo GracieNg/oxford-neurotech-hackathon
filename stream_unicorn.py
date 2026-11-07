@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """stream_unicorn.py: ONE file to stream + record the g.tec Unicorn.
 
-  * finds the Unicorn (LSL stream from the "Unicorn LSL" app, or UnicornPy directly on Windows)
+  * finds the Unicorn: Bluetooth serial (macOS/Linux, no g.tec software), the "Unicorn LSL" app, or UnicornPy (Windows)
   * records EEG + any experiment markers into ONE CSV:  recordings/unicorn_<time>.csv
         columns: lsl_time, EEG 1..8, marker
   * prints live signal quality every second
   * serves band-power features on ws://<this-laptop>:8765 for dashboard/index.html and mindcart.html
 
-Install once:   pip install numpy scipy pylsl websockets
+Install once:   pip install numpy scipy pylsl websockets pyserial
+Mac:            pair "UN-xxxx" in System Settings > Bluetooth, then just run the commands below
 Test device:    python stream_unicorn.py --check         (~60 s guided test -> PASS/FAIL)
-Run:            python stream_unicorn.py                 (auto: LSL first, then UnicornPy)
+Run:            python stream_unicorn.py                 (auto: Bluetooth serial -> LSL -> UnicornPy)
                 python stream_unicorn.py --source unicornpy
                 python stream_unicorn.py --fake          (no headset, for testing)
 Stop:           Ctrl+C  (file is saved continuously)
@@ -95,6 +96,90 @@ class UnicornPySource:
 
     def close(self):
         self.dev.StopAcquisition()
+
+
+class SerialSource:
+    """macOS/Linux: read the Unicorn directly over its Bluetooth serial port (no g.tec software needed).
+
+    Pair "UN-xxxx.xx.xx" in System Settings > Bluetooth first. It shows up as /dev/cu.UN-*.
+    Frame = 45 bytes: C0 00 | battery | 8x EEG int24 BE | 3x acc int16 LE | 3x gyro int16 LE | counter u32 LE | 0D 0A
+    Also republishes everything as an LSL stream "Unicorn" (type EEG) so other tools can use it.
+    """
+    START, STOP = bytes([0x61, 0x7C, 0x87]), bytes([0x63, 0x5C, 0xC5])
+    FRAME = 45
+    UV = 4500000.0 / 50331642.0
+
+    def __init__(self, port=None, lsl_out=True):
+        import glob
+        import serial  # pip install pyserial
+        if port is None:
+            ports = sorted(glob.glob("/dev/cu.UN-*") + glob.glob("/dev/tty.UN-*") + glob.glob("/dev/rfcomm*"))
+            if not ports:
+                raise RuntimeError("No Unicorn serial port (/dev/cu.UN-*). Pair the headset in Bluetooth settings first.")
+            port = ports[0]
+        print(f"[source] Bluetooth serial: {port}  (connecting… the LED should stop blinking)")
+        self.ser = serial.Serial(port, 115200, timeout=1)
+        self.ser.reset_input_buffer()
+        self.ser.write(self.START)
+        self.buf = bytearray()
+        self.last_counter = None
+        self.dropped = 0
+        self.outlet = None
+        if lsl_out:
+            try:
+                from pylsl import StreamInfo, StreamOutlet
+                info = StreamInfo("Unicorn", "EEG", N_EEG, FS, "float32", "unicorn_serial")
+                chs = info.desc().append_child("channels")
+                for c in CH:
+                    chs.append_child("channel").append_child_value("label", c).append_child_value("unit", "microvolts")
+                self.outlet = StreamOutlet(info)
+                print("[source] republishing as LSL stream 'Unicorn' (type EEG)")
+            except Exception as e:
+                print(f"[source] (LSL republish off: {e})")
+
+    @classmethod
+    def parse(cls, fr):
+        eeg = []
+        for i in range(8):
+            b = fr[3 + 3 * i: 6 + 3 * i]
+            v = (b[0] << 16) | (b[1] << 8) | b[2]
+            if v & 0x800000:
+                v -= 1 << 24
+            eeg.append(v * cls.UV)
+        counter = int.from_bytes(fr[39:43], "little")
+        battery = (fr[2] & 0x0F) * 100.0 / 15.0
+        return eeg, counter, battery
+
+    def read(self):
+        from pylsl import local_clock
+        self.buf += self.ser.read(max(self.FRAME, self.ser.in_waiting or 0))
+        rows = []
+        while len(self.buf) >= self.FRAME:
+            if self.buf[0] != 0xC0 or self.buf[1] != 0x00 or self.buf[43] != 0x0D or self.buf[44] != 0x0A:
+                j = self.buf.find(b"\xC0\x00", 1)          # resync
+                self.buf = self.buf[j:] if j > 0 else bytearray()
+                continue
+            eeg, counter, self.battery = self.parse(bytes(self.buf[:self.FRAME]))
+            del self.buf[:self.FRAME]
+            if self.last_counter is not None and counter != self.last_counter + 1:
+                self.dropped += max(0, counter - self.last_counter - 1)
+            self.last_counter = counter
+            rows.append(eeg)
+        if not rows:
+            return np.empty((0, N_EEG)), np.empty(0), []
+        now = local_clock()
+        ts = now - (len(rows) - 1 - np.arange(len(rows))) / FS
+        x = np.asarray(rows)
+        if self.outlet:
+            self.outlet.push_chunk(x.tolist(), now)
+        return x, ts, []
+
+    def close(self):
+        try:
+            self.ser.write(self.STOP); self.ser.close()
+        except Exception:
+            pass
+        print(f"\n[source] stopped. dropped samples: {self.dropped}")
 
 
 class FakeSource:
@@ -227,7 +312,8 @@ def device_check(src, out: Path):
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", choices=["auto", "lsl", "unicornpy"], default="auto")
+    ap.add_argument("--source", choices=["auto", "lsl", "serial", "unicornpy"], default="auto")
+    ap.add_argument("--serial", dest="serial_port", default=None, help="serial port for --source serial (default: /dev/cu.UN-*)")
     ap.add_argument("--fake", action="store_true")
     ap.add_argument("--out", default="recordings")
     ap.add_argument("--name", default=None, help="file name (default unicorn_<date_time>.csv)")
@@ -240,17 +326,23 @@ def main():
         src = FakeSource(check=a.check)
     elif a.source == "unicornpy":
         src = UnicornPySource()
-    else:
+    elif a.source == "serial":
+        src = SerialSource(a.serial_port)
+    elif a.source == "lsl":
         try:
             src = LSLSource()
         except Exception as e:
-            if a.source == "lsl":
-                raise SystemExit(str(e))
-            print(f"[source] LSL failed: {e}\n[source] trying UnicornPy ...")
+            raise SystemExit(str(e))
+    else:  # auto: serial (Mac/Linux) -> LSL -> UnicornPy (Windows)
+        errs, src = [], None
+        for name, make in (("Bluetooth serial", lambda: SerialSource(a.serial_port)),
+                           ("LSL", lambda: LSLSource(timeout=4)), ("UnicornPy", UnicornPySource)):
             try:
-                src = UnicornPySource()
-            except Exception as e2:
-                raise SystemExit(f"Could not connect to the Unicorn.\n  LSL: {e}\n  UnicornPy: {e2}")
+                src = make(); break
+            except Exception as e:
+                errs.append(f"  {name}: {e}"); print(f"[source] {name} not available, trying next…")
+        if src is None:
+            raise SystemExit("Could not connect to the Unicorn.\n" + "\n".join(errs))
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     if a.check:
@@ -271,7 +363,11 @@ def main():
     def acquire():
         n, last_print, pending = 0, time.time(), []
         while not stop.is_set():
-            x, ts, mks = src.read()
+            try:
+                x, ts, mks = src.read()
+            except Exception as e:
+                print(f"\n[source] headset disconnected / read error: {e}\n[source] stopping. Data so far is saved; rerun to continue.")
+                stop.set(); break
             pending += mks
             for row, t in zip(x, ts):
                 m = ""
@@ -303,7 +399,7 @@ def main():
         async with websockets.serve(handler, "0.0.0.0", a.port):
             print(f"[ws] dashboards: open dashboard/mindcart.html?ws=ws://localhost:{a.port}")
             last = None
-            while True:
+            while not stop.is_set():
                 await asyncio.sleep(0.2)
                 f = latest["f"]
                 if f is not None and f is not last:
