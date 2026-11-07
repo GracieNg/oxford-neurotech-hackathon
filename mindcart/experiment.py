@@ -5,9 +5,14 @@ Trial: fixation 1 s -> product image 4 s -> "How interested are you? 1-5" (keys 
 
     python mindcart/experiment.py --pid P01 --items stimuli/items.csv --img-dir stimuli/norm
     python mindcart/experiment.py --pid TEST --n 5 --windowed     # 5-trial sync check
+    python mindcart/experiment.py --pid OB01 --oddball            # ~4 min P300 validation (no images needed)
+
+Oddball: blue circles (80%) and rare orange squares (20%), 200 ms each, every 0.9-1.2 s.
+The participant silently counts the orange squares. Targets should give a clear P300 at Pz.
 
 Markers (string, one per event):
   start | fix|<trial> | img|<trial>|<item_id> | rate|<trial>|<item_id>|<rating>|<rt> | break | end
+  oddball: odd|<trial>|target  /  odd|<trial>|standard
 Also writes sessions/<pid>/behaviour.csv as a backup.
 """
 import argparse
@@ -31,7 +36,11 @@ def main():
     ap.add_argument("--windowed", action="store_true")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--out", default="sessions")
+    ap.add_argument("--oddball", action="store_true", help="run the P300 oddball validation instead")
+    ap.add_argument("--n-oddball", type=int, default=200)
     a = ap.parse_args()
+    if a.oddball:
+        return run_oddball(a)
 
     with open(a.items) as f:
         items = list(csv.DictReader(f))
@@ -99,6 +108,39 @@ def main():
         win.flip(); core.wait(rng.uniform(0.5, 0.9))
     show_msg("Done, thank you!\n\nPress SPACE to finish.")
     quit_()
+
+
+def run_oddball(a):
+    rng = random.Random(a.seed if a.seed is not None else zlib.crc32(a.pid.encode()))
+    # 20% targets, never two targets in a row, first 3 are standards
+    kinds = ["standard"] * 3
+    while len(kinds) < a.n_oddball:
+        kinds.append("target" if (rng.random() < 0.25 and kinds[-1] != "target") else "standard")
+    outlet = StreamOutlet(StreamInfo("MindCartMarkers", "Markers", 1, 0, "string", f"mindcart_{a.pid}"))
+    win = visual.Window(size=(1280, 800) if a.windowed else None, fullscr=not a.windowed, color=(0, 0, 0), units="height")
+    msg = visual.TextStim(win, "", height=0.04, color="white", wrapWidth=1.2)
+    fix = visual.TextStim(win, "+", height=0.06, color="white")
+    std = visual.Circle(win, radius=0.08, fillColor=(-0.6, -0.2, 0.9), lineColor=None)
+    tgt = visual.Rect(win, width=0.16, height=0.16, fillColor=(1.0, 0.3, -0.6), lineColor=None)
+    mark = lambda s: outlet.push_sample([s], local_clock())
+
+    def wait_space(text):
+        msg.text = text; msg.draw(); win.flip()
+        if "escape" in event.waitKeys(keyList=["space", "escape"]):
+            mark("end"); win.close(); core.quit()
+
+    wait_space("Keep your eyes on the centre and stay still.\n\nCOUNT the ORANGE SQUARES silently.\n"
+               "Ignore the blue circles. Try not to blink while shapes are on screen.\n\nPress SPACE to start.")
+    core.wait(1.0); mark("start")
+    for k, kind in enumerate(kinds):
+        (tgt if kind == "target" else std).draw(); fix.draw()
+        win.callOnFlip(mark, f"odd|{k}|{kind}"); win.flip(); core.wait(0.2)
+        fix.draw(); win.flip(); core.wait(rng.uniform(0.7, 1.0))
+        if event.getKeys(["escape"]):
+            break
+    n_t = kinds.count("target")
+    wait_space(f"Done! How many orange squares did you count?\n(Answer: {n_t})\n\nPress SPACE.")
+    mark("end"); win.close(); core.quit()
 
 
 if __name__ == "__main__":
