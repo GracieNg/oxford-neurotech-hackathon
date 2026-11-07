@@ -2,3 +2,6 @@ reports/
 __pycache__/
 *.pyc
 .pytest_cache/
+sessions/
+sim/
+stimuli/norm/

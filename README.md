@@ -20,6 +20,8 @@ python scripts/live.py --replay UnicornRecorder_07_11_2026_17_30_360.csv --ws 87
 python scripts/live.py --lsl --ws 8765                       # on the headset laptop
 ```
 
+**Live dashboard:** open `dashboard/index.html` in a browser and click **Connect**, or add `?ws=ws://<laptop-ip>:8765` to the URL. Add `?demo` instead for a fake demo with no backend. It shows electrode quality on a head map, band power per channel, relaxation and engagement meters, and a 60 s trend. It also works on a phone.
+
 The app connects to `ws://<laptop-ip>:8765` and gets one JSON frame per second:
 
 ```json
@@ -38,6 +40,7 @@ The app connects to `ws://<laptop-ip>:8765` and gets one JSON frame per second:
 | `eeg_pipeline/features.py` | Welch PSD and band power |
 | `eeg_pipeline/quality.py` | Per-channel `good / flat / noisy / artefact` |
 | `eeg_pipeline/pipeline.py` | `EEGPipeline.push(chunk)` → feature frames; `process_recording`, `run_live` |
+| `dashboard/index.html` | Live web dashboard (no install, reads the WebSocket, has a demo mode) |
 | `scripts/` | `analyse_recording.py` (report and plots), `live.py` (live stream and WebSocket) |
 
 ## Findings on the 7 Nov recordings
