@@ -39,6 +39,18 @@ Create `sessions/P01/prefs.csv` (template: `mindcart/prefs_template.csv`). Rate 
 
 A session lasts about 8 s per trial, so 80 items take about 11 minutes, with a break halfway.
 
+## 2b. ERP check: P300 oddball (do this once, ~4 min)
+
+Proves the markers, timing and headset record real brain responses before you spend time on the product task.
+
+```bash
+python -m mindcart.record_session --pid OB01            # terminal 1
+python mindcart/experiment.py --pid OB01 --oddball      # terminal 2: count the orange squares
+python -m mindcart.erp sessions/OB01 --oddball          # -> sessions/OB01/oddball_p300.png + PASS/FAIL
+```
+
+PASS means the rare orange squares give a P300 at Pz (280–480 ms) that is clearly larger than for the blue circles.
+
 ## 3. Features → models
 
 ```bash
@@ -52,6 +64,11 @@ This gives `sessions/results.csv` and `sessions/results.png`, which is the slide
 - **EEG features (8, hypothesis-driven):** Fz theta and Fz beta, posterior and central alpha, C4–C3 and PO8–PO7 alpha asymmetry, β/α, and posterior theta. Each is a log change from the fixation baseline, measured 0.5–4 s after image onset. Use `--full` for all 24. The Unicorn has no F3/F4, so the classic frontal alpha asymmetry isn't available.
 - **Evaluation:** within each participant, 5-fold CV repeated 10 times, giving balanced accuracy, F1 and a majority baseline. Then a 500-shuffle **permutation test** for the p-value and the 95% chance line. **C − A** is the headline number: what EEG adds on top of product data.
 - **Artefacts:** trials with more than 200 µV peak-to-peak in the analysis window are dropped (`--ptp`).
+- **ERP features (P300 + LPP):** filtered 0.1–30 Hz (slow waves survive), epochs −200 to 1000 ms around image onset, baseline −200 to 0 ms, epochs over ±100 µV at Fz/Cz/Pz rejected.
+  - `f_p300_pz`, `f_p300_cz`: mean 250–500 ms. Attention, "this caught my eye".
+  - `f_lpp_pz`, `f_lpp_cpz`: mean 500–1000 ms. Sustained motivational significance (interest or liking).
+  - Rejected epochs get NaN and are imputed inside each CV training fold.
+- **ERP plot:** `python -m mindcart.erp sessions/P01` gives `sessions/P01/erp.png` (liked vs not liked at Pz and Cz).
 
 ## Test without hardware
 
@@ -67,6 +84,7 @@ Checked on simulated data with 70 items and 2 participants:
 | none | 0.60–0.63 | 0.48 (p ≈ 0.6–0.7, chance ✔) | 0.56–0.58 | −0.04 |
 | weak (0.6) | 0.60–0.63 | 0.50–0.59 (n.s.) | 0.61–0.64 | +0.01 |
 | strong (2.0) | 0.60–0.63 | **0.76–0.82 (p ≤ 0.01)** | **0.75–0.83** | **+0.15–0.20** |
+| medium (1.0) + P300/LPP | 0.60–0.62 | 0.64–0.79 (p ≤ 0.025) | 0.64–0.84 | +0.05–0.22 |
 
 So when there's no real effect, the permutation test correctly says chance. A weak effect isn't detectable with about 46 usable trials, so more trials per person matter more than more people.
 

@@ -8,6 +8,9 @@ Per trial:
   band power (Welch) in theta 4-8, alpha 8-13, beta 13-30 Hz, as log change vs baseline
 Trials whose analysis window exceeds the artefact threshold (blinks/movement) are flagged.
 
+ERP features (see mindcart/erp.py): epochs -0.2..1.0 s, 0.1-30 Hz, baseline -200..0 ms,
+  f_p300_pz/cz = mean 250-500 ms, f_lpp_pz/cpz = mean 500-1000 ms (NaN if the epoch is rejected).
+
 Writes sessions/P01/trials.csv: trial, item_id, rating, label, ok, <reduced feats>, <full feats>
 """
 import argparse
@@ -20,6 +23,7 @@ from scipy.signal import welch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from eeg_pipeline import PipelineConfig, filter_offline  # noqa: E402
+from mindcart.erp import epochs as erp_epochs, erp_features, erp_filter  # noqa: E402
 
 FS = 250.0
 BANDS = {"theta": (4, 8), "alpha": (8, 13), "beta": (13, 30)}
@@ -93,6 +97,11 @@ def extract(sdir, like="extreme", ptp_uv=200.0):
                 rec[f"full_{c}_{b}"] = float(d[b][idx[c]])
         out.append(rec)
     df = pd.DataFrame(out)
+    # ERP (P300 / LPP): different filter (0.1-30 Hz) and time-locked epochs
+    ep, times, ok_erp = erp_epochs(erp_filter(x), t, trials.set_index("trial").loc[df["trial"], "onset"].to_numpy())
+    for k, v in erp_features(ep, times, ok_erp).items():
+        df[k] = v
+    df["ok_erp"] = ok_erp
     df["label"] = make_labels(df["rating"], like)
     df.to_csv(sdir / "trials.csv", index=False)
     return df
@@ -115,7 +124,7 @@ def main():
     for s in a.session_dirs:
         df = extract(s, a.like, a.ptp)
         lab = df["label"]
-        print(f"{s}: {len(df)} trials | artefact-rejected {(~df['ok']).sum()} | "
+        print(f"{s}: {len(df)} trials | artefact-rejected {(~df['ok']).sum()} (ERP {(~df['ok_erp']).sum()}) | "
               f"like {int((lab == 1).sum())} / dislike {int((lab == 0).sum())} / excluded {int(lab.isna().sum())}")
 
 

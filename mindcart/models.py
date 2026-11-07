@@ -23,6 +23,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, f1_score
 from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold, permutation_test_score
+from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -60,7 +61,7 @@ def build_table(sdir: Path, items: pd.DataFrame, use_full=False):
 
 
 def clf():
-    return make_pipeline(StandardScaler(), LogisticRegression(C=0.5, class_weight="balanced", max_iter=2000))
+    return make_pipeline(SimpleImputer(strategy="mean"), StandardScaler(), LogisticRegression(C=0.5, class_weight="balanced", max_iter=2000))
 
 
 def cv_scores(X, y, model, n_rep=10, seed=0):
