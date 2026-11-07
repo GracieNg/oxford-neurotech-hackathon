@@ -14,9 +14,9 @@ Unicorn ─LSL─▶ input adapter ─▶ stateful filter (1–40 Hz + 50 Hz not
 ```bash
 pip install -r requirements.txt
 pytest -q                                                    # 7 tests
-python scripts/analyse_recording.py UnicornRecorder_*.csv    # quality report → reports/
+python scripts/analyse_recording.py data/raw/2026-11-07/UnicornRecorder_*.csv    # quality report → reports/
 python scripts/live.py --synthetic                           # fake live stream
-python scripts/live.py --replay UnicornRecorder_07_11_2026_17_30_360.csv --ws 8765
+python scripts/live.py --replay data/raw/2026-11-07/UnicornRecorder_07_11_2026_17_30_360.csv --ws 8765
 python scripts/live.py --lsl --ws 8765                       # on the headset laptop
 ```
 
@@ -75,3 +75,11 @@ Until step 2 passes, we shouldn't claim the system detects relaxation or attenti
 - `StreamingFilter` is causal and keeps its state between chunks, so there's no look-ahead and no window-edge artefacts. The tests check that the output doesn't depend on chunk size and that later samples can't change earlier output.
 - The first 4 s after starting are skipped while the filter settles.
 - Don't commit identifiable participant data.
+
+## Data layout
+
+```
+data/raw/2026-11-07/   original Unicorn Recorder exports (.csv + .bdf), 5 sessions × 2 recorders
+data/merged/           all sessions of each recorder in ONE csv (zipped; columns: session_start, source_file, time_s, EEG 1-8, TRIG)
+recordings/            new recordings from stream_unicorn.py (not committed)
+```
