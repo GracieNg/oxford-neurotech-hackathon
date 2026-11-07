@@ -8,6 +8,7 @@
   * serves band-power features on ws://<this-laptop>:8765 for dashboard/index.html and mindcart.html
 
 Install once:   pip install numpy scipy pylsl websockets
+Test device:    python stream_unicorn.py --check         (~60 s guided test -> PASS/FAIL)
 Run:            python stream_unicorn.py                 (auto: LSL first, then UnicornPy)
                 python stream_unicorn.py --source unicornpy
                 python stream_unicorn.py --fake          (no headset, for testing)
@@ -97,7 +98,8 @@ class UnicornPySource:
 
 
 class FakeSource:
-    def __init__(self):
+    def __init__(self, check=False):
+        self.check = check
         print("[source] FAKE synthetic EEG (eyes closed every other 20 s)")
         self.k = 0; self.t0 = time.time(); self.rng = np.random.default_rng(0)
 
@@ -106,8 +108,10 @@ class FakeSource:
         n = int((time.time() - self.t0) * FS) - self.k
         t = (self.k + np.arange(n)) / FS; self.k += n
         x = self.rng.normal(0, 8, (n, N_EEG))
-        closed = (t // 20) % 2 == 1
+        closed = ((t // 20) % 2 == 1) if not self.check else ((t > 25) & (t < 45))
         x[:, 4:] += (6 + 10 * closed[:, None]) * np.sin(2 * np.pi * 10 * t)[:, None]
+        if self.check:  # blinks every 2 s in the last phase
+            x[:, 0] += 150 * np.exp(-0.5 * (((t - 46) % 2 - 1) / 0.08) ** 2) * (t > 46)
         return x + 3000, self.t0 + t, []
 
 
@@ -157,6 +161,69 @@ class Processor:
         return feat
 
 
+# ----------------------------------------------------------------- device check
+def device_check(src, out: Path):
+    """Guided ~60 s test: signal amplitude, eyes-closed alpha, blink detection. Prints PASS/FAIL."""
+    from scipy.signal import sosfiltfilt
+
+    def collect(seconds, label):
+        print(f"\n>>> {label}  ({seconds} s)", flush=True)
+        xs, t_end = [], time.time() + seconds
+        while time.time() < t_end:
+            x, _, _ = src.read()
+            if len(x):
+                xs.append(x)
+            left = int(t_end - time.time())
+            print(f"\r    {left:2d} s left", end="", flush=True)
+        print()
+        return np.vstack(xs) if xs else np.empty((0, N_EEG))
+
+    print("\n=== UNICORN DEVICE CHECK ===  sit still, relaxed, look at the screen")
+    collect(5, "Settling, sit still")
+    opn = collect(20, "EYES OPEN, look at a point on the screen, don't blink much")
+    cls = collect(20, "EYES CLOSED, relax and keep them closed until you hear the beep")
+    print("\a", end="")
+    blk = collect(10, "EYES OPEN, now BLINK FIRMLY 5 times, about 2 s apart")
+
+    sos = butter(4, [1, 40], btype="band", fs=FS, output="sos")
+    b, a = iirnotch(50, 30, fs=FS); sos = np.vstack([sos, tf2sos(b, a)])
+    filt = lambda x: sosfiltfilt(sos, x - np.median(x, 0), axis=0)[int(FS):-int(FS)]
+    yo, yc, yb = filt(opn), filt(cls), filt(blk)
+
+    def alpha(y):
+        f, p = welch(y.T, fs=FS, nperseg=int(2 * FS))
+        return p[:, (f >= 8) & (f < 13)].mean(1)
+
+    sd = np.median(yo[:len(yo) // int(FS) * int(FS)].reshape(-1, int(FS), N_EEG).std(1), 0)
+    ratio = alpha(yc) / np.maximum(alpha(yo), 1e-12)
+    post = [i for i, c in enumerate(CH) if c[0] in "PO"]
+    fz = yb[:, 0]
+    thr = max(80.0, 5 * np.median(np.abs(fz)))
+    above = np.flatnonzero(fz > thr)
+    blinks = int((np.diff(above) > FS * 0.4).sum() + (1 if len(above) else 0))
+
+    ok_ch = [(2 <= s <= 60) for s in sd]
+    alpha_ok = np.median(ratio[post]) >= 1.3
+    blink_ok = 3 <= blinks <= 8
+    print("\n=== RESULTS ===")
+    print(f"{'ch':4s} {'σ µV (eyes open)':>17s} {'α closed/open':>14s}  status")
+    for i, c in enumerate(CH):
+        print(f"{c:4s} {sd[i]:17.1f} {ratio[i]:14.2f}  {'OK' if ok_ch[i] else ('FLAT' if sd[i] < 2 else 'NOISY: re-seat/wet electrode')}")
+    print(f"\nSignal amplitude : {sum(ok_ch)}/8 channels in 2-60 µV          {'PASS' if sum(ok_ch) >= 7 else 'FAIL'}")
+    print(f"Eyes-closed alpha: posterior ×{np.median(ratio[post]):.2f} (need ≥1.3)        {'PASS' if alpha_ok else 'FAIL'}")
+    print(f"Blink detection  : {blinks} blinks seen on Fz (asked for 5)     {'PASS' if blink_ok else 'CHECK'}")
+    verdict = sum(ok_ch) >= 7 and alpha_ok
+    print(f"\nOVERALL: {'✅ READY TO RECORD' if verdict else '❌ NOT READY: fix the channels marked NOISY/FLAT, then rerun'}")
+    path = out / f"device_check_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh); w.writerow(["phase"] + [f"EEG {i + 1}" for i in range(N_EEG)])
+        for ph, x in (("open", opn), ("closed", cls), ("blink", blk)):
+            for row in x:
+                w.writerow([ph] + [f"{v:.3f}" for v in row])
+    print(f"Raw check data saved: {path.resolve()}")
+    return verdict
+
+
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -166,10 +233,11 @@ def main():
     ap.add_argument("--name", default=None, help="file name (default unicorn_<date_time>.csv)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-ws", action="store_true")
+    ap.add_argument("--check", action="store_true", help="run the ~60 s guided device test and exit")
     a = ap.parse_args()
 
     if a.fake:
-        src = FakeSource()
+        src = FakeSource(check=a.check)
     elif a.source == "unicornpy":
         src = UnicornPySource()
     else:
@@ -185,6 +253,13 @@ def main():
                 raise SystemExit(f"Could not connect to the Unicorn.\n  LSL: {e}\n  UnicornPy: {e2}")
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    if a.check:
+        try:
+            ok = device_check(src, out)
+        finally:
+            if hasattr(src, "close"):
+                src.close()
+        raise SystemExit(0 if ok else 1)
     path = out / (a.name or f"unicorn_{datetime.now():%Y%m%d_%H%M%S}.csv")
     fh = open(path, "w", newline=""); w = csv.writer(fh)
     w.writerow(["lsl_time"] + [f"EEG {i + 1}" for i in range(N_EEG)] + ["marker"])
