@@ -6,6 +6,7 @@
         columns: lsl_time, EEG 1..8, marker
   * prints live signal quality every second
   * serves band-power features on ws://<this-laptop>:8765 for dashboard/index.html and mindcart.html
+  * serves raw EEG on ws://<this-laptop>:8766 for dashboard/pipeline.html (live step-by-step pipeline board)
 
 Install once:   pip install numpy scipy pylsl websockets pyserial
 Mac:            pair "UN-xxxx" in System Settings > Bluetooth, then just run the commands below
@@ -357,7 +358,9 @@ def main():
     w.writerow(["lsl_time"] + [f"EEG {i + 1}" for i in range(N_EEG)] + ["marker"])
     print(f"[record] writing ONE file: {path.resolve()}")
 
-    proc, latest, clients = Processor(), {"f": None}, set()
+    proc, latest, clients, raw_clients = Processor(), {"f": None}, set(), set()
+    import collections
+    raw_q = collections.deque(maxlen=5000)   # raw samples for the live pipeline board
     stop = threading.Event()
 
     def acquire():
@@ -375,6 +378,8 @@ def main():
                     m = (m + ";" if m else "") + pending.pop(0)[1]
                 w.writerow([f"{t:.6f}"] + [f"{v:.3f}" for v in row] + [m])
             n += len(x)
+            if raw_clients:
+                raw_q.extend(zip(ts.tolist(), x.round(3).tolist()))
             for f in proc.push(x):
                 latest["f"] = f
             if time.time() - last_print > 1 and latest["f"]:
@@ -396,8 +401,30 @@ def main():
                 await ws.wait_closed()
             finally:
                 clients.discard(ws)
-        async with websockets.serve(handler, "0.0.0.0", a.port):
-            print(f"[ws] dashboards: open dashboard/mindcart.html?ws=ws://localhost:{a.port}")
+        async def raw_handler(ws):
+            raw_clients.add(ws)
+            try:
+                await ws.wait_closed()
+            finally:
+                raw_clients.discard(ws)
+
+        async def pump_raw():
+            while not stop.is_set():
+                await asyncio.sleep(0.05)
+                if not raw_q:
+                    continue
+                items = [raw_q.popleft() for _ in range(len(raw_q))]
+                msg = json.dumps({"type": "raw", "fs": FS, "ch": CH, "t": [i[0] for i in items], "x": [i[1] for i in items]})
+                for c in list(raw_clients):
+                    try:
+                        await c.send(msg)
+                    except Exception:
+                        raw_clients.discard(c)
+
+        async with websockets.serve(handler, "0.0.0.0", a.port), websockets.serve(raw_handler, "0.0.0.0", a.port + 1):
+            print(f"[ws] features : ws://localhost:{a.port}   -> dashboard/mindcart.html?ws=ws://localhost:{a.port}")
+            print(f"[ws] raw EEG  : ws://localhost:{a.port + 1} -> dashboard/pipeline.html?ws=ws://localhost:{a.port + 1}")
+            asyncio.get_running_loop().create_task(pump_raw())
             last = None
             while not stop.is_set():
                 await asyncio.sleep(0.2)
