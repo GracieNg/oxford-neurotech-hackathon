@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import sys
 import threading
 import time
@@ -37,6 +38,30 @@ WIN, STEP = int(2 * FS), int(1 * FS)
 
 
 # ----------------------------------------------------------------- sources
+class MarkerListener:
+    """Finds the experiment's LSL marker stream (type 'Markers') whenever it appears, in a background
+    thread, and hands its markers (on the local LSL clock) to the recorder. Used for every source."""
+    def __init__(self):
+        self.inlet, self.found = None, threading.Event()
+        threading.Thread(target=self._find, daemon=True).start()
+
+    def _find(self):
+        from pylsl import StreamInlet, proc_clocksync, proc_dejitter, resolve_byprop
+        while self.inlet is None:
+            m = resolve_byprop("type", "Markers", timeout=2.0)
+            if m:
+                self.inlet = StreamInlet(m[0], max_buflen=360, processing_flags=proc_clocksync | proc_dejitter)
+                self.inlet.open_stream(timeout=5.0)
+                print(f"\n[markers] experiment stream connected: {m[0].name()}", flush=True)
+                self.found.set()
+
+    def poll(self):
+        if self.inlet is None:
+            return []
+        md, mt = self.inlet.pull_chunk(timeout=0.0)
+        return [(t, str(d[0])) for d, t in zip(md, mt)]
+
+
 class LSLSource:
     def __init__(self, timeout=8):
         from pylsl import StreamInlet, proc_clocksync, proc_dejitter, resolve_streams
@@ -50,25 +75,10 @@ class LSLSource:
         s = eeg[0]
         print(f"[source] LSL: {s.name()}  type={s.type()}  {s.channel_count()} ch @ {s.nominal_srate():.0f} Hz")
         self.inlet = StreamInlet(s, max_buflen=30, processing_flags=proc_clocksync | proc_dejitter)
-        self.markers = None
-        mk = [m for m in streams if m.type().lower() == "markers"]
-        if mk:
-            print(f"[source] markers: {mk[0].name()}")
-            self.markers = StreamInlet(mk[0], processing_flags=proc_clocksync | proc_dejitter)
-        self._find_markers_later = not mk
 
     def read(self):
         data, ts = self.inlet.pull_chunk(timeout=0.1, max_samples=256)
         mks = []
-        if self._find_markers_later and int(time.time()) % 5 == 0:   # experiment may start later
-            from pylsl import StreamInlet, resolve_byprop
-            m = resolve_byprop("type", "Markers", timeout=0.05)
-            if m:
-                print(f"[source] markers stream appeared: {m[0].name()}")
-                self.markers = StreamInlet(m[0]); self._find_markers_later = False
-        if self.markers:
-            md, mt = self.markers.pull_chunk(timeout=0.0)
-            mks = [(t, str(d[0])) for d, t in zip(md, mt)]
         return (np.asarray(data, float)[:, :N_EEG] if data else np.empty((0, N_EEG))), np.asarray(ts), mks
 
 
@@ -85,7 +95,8 @@ class UnicornPySource:
         self.n = 25
         self.buf = bytearray(self.n * self.n_ch * 4)
         self.dev.StartAcquisition(False)
-        self.t0 = time.time()
+        from pylsl import local_clock
+        self.t0 = local_clock()
         self.count = 0
 
     def read(self):
@@ -110,21 +121,57 @@ class SerialSource:
     FRAME = 45
     UV = 4500000.0 / 50331642.0
 
+    @classmethod
+    def _probe(cls, serial, port, wait=6.0):
+        """Open the port, send START, return the open Serial if bytes arrive within `wait` s, else None."""
+        try:
+            s = serial.Serial(port, 115200, timeout=0.5)
+            s.reset_input_buffer()
+            s.write(cls.START)
+            t0 = time.time()
+            while time.time() - t0 < wait:
+                if s.read(cls.FRAME):
+                    return s
+            try:
+                s.write(cls.STOP)
+            except Exception:
+                pass
+            s.close()
+        except Exception as e:
+            print(f"[source]   {port}: {e}")
+        return None
+
     def __init__(self, port=None, lsl_out=True):
         import glob
         import serial  # pip install pyserial
+        port = port or os.environ.get("UNSWAY_SERIAL")
         if port is None:
-            ports = sorted(glob.glob("/dev/cu.UN-*") + glob.glob("/dev/tty.UN-*") + glob.glob("/dev/rfcomm*"))
+            # newest headset first (UN-2026… before UN-2023…); several may be paired
+            ports = sorted(set(glob.glob("/dev/cu.UN-*") + glob.glob("/dev/rfcomm*")), reverse=True)
             if not ports:
                 raise RuntimeError("No Unicorn serial port (/dev/cu.UN-*). Pair the headset in Bluetooth settings first.")
-            port = ports[0]
-        print(f"[source] Bluetooth serial: {port}  (connecting… the LED should stop blinking)")
-        self.ser = serial.Serial(port, 115200, timeout=1)
-        self.ser.reset_input_buffer()
-        self.ser.write(self.START)
+            print(f"[source] paired Unicorns: {', '.join(ports)}")
+            self.ser = None
+            for p in ports:
+                print(f"[source] trying {p} …  (the headset must be ON; its LED stops blinking when connected)")
+                s = self._probe(serial, p)
+                if s is not None:
+                    self.ser, port = s, p
+                    break
+                print(f"[source]   no data from {p} (off, out of range, or a different headset)")
+            if self.ser is None:
+                raise RuntimeError("None of the paired Unicorns sent data. Turn the headset on (LED blinking), "
+                                   "close any other app/laptop using it, and try again.")
+        else:
+            self.ser = self._probe(serial, port)
+            if self.ser is None:
+                raise RuntimeError(f"No data from {port}. Is the headset on and not used by another computer?")
+        print(f"[source] Bluetooth serial: {port}  CONNECTED, data flowing")
         self.buf = bytearray()
         self.last_counter = None
         self.dropped = 0
+        import collections
+        self._obs, self.offset, self.n_samples = collections.deque(), None, 0
         self.outlet = None
         if lsl_out:
             try:
@@ -154,7 +201,7 @@ class SerialSource:
     def read(self):
         from pylsl import local_clock
         self.buf += self.ser.read(max(self.FRAME, self.ser.in_waiting or 0))
-        rows = []
+        rows, counters = [], []
         while len(self.buf) >= self.FRAME:
             if self.buf[0] != 0xC0 or self.buf[1] != 0x00 or self.buf[43] != 0x0D or self.buf[44] != 0x0A:
                 j = self.buf.find(b"\xC0\x00", 1)          # resync
@@ -165,14 +212,25 @@ class SerialSource:
             if self.last_counter is not None and counter != self.last_counter + 1:
                 self.dropped += max(0, counter - self.last_counter - 1)
             self.last_counter = counter
-            rows.append(eeg)
+            rows.append(eeg); counters.append(counter)
         if not rows:
             return np.empty((0, N_EEG)), np.empty(0), []
+        # Timing from the headset's own sample counter, NOT Bluetooth arrival time (which comes in bursts).
+        # offset = clock time of counter 0. Bluetooth only ever adds delay, so the smallest
+        # (arrival - counter/FS) over the last 30 s is the best estimate; it also tracks slow clock drift.
         now = local_clock()
-        ts = now - (len(rows) - 1 - np.arange(len(rows))) / FS
+        c = np.asarray(counters, float)
+        obs = now - c[-1] / FS
+        self._obs.append((now, obs))
+        while self._obs and now - self._obs[0][0] > 30.0:
+            self._obs.popleft()
+        floor = min(o for _, o in self._obs)
+        self.offset = floor if self.offset is None else self.offset + 0.1 * (floor - self.offset)
+        ts = self.offset + c / FS
+        self.n_samples += len(rows)
         x = np.asarray(rows)
         if self.outlet:
-            self.outlet.push_chunk(x.tolist(), now)
+            self.outlet.push_chunk(x.tolist(), float(ts[-1]))
         return x, ts, []
 
     def close(self):
@@ -180,18 +238,20 @@ class SerialSource:
             self.ser.write(self.STOP); self.ser.close()
         except Exception:
             pass
-        print(f"\n[source] stopped. dropped samples: {self.dropped}")
+        tot = self.n_samples + self.dropped
+        print(f"\n[source] stopped. dropped samples: {self.dropped} of {tot} ({100 * self.dropped / max(tot, 1):.2f}%)")
 
 
 class FakeSource:
     def __init__(self, check=False):
         self.check = check
         print("[source] FAKE synthetic EEG (eyes closed every other 20 s)")
-        self.k = 0; self.t0 = time.time(); self.rng = np.random.default_rng(0)
+        from pylsl import local_clock
+        self.k = 0; self.t0 = local_clock(); self.w0 = time.time(); self.rng = np.random.default_rng(0)
 
     def read(self):
         time.sleep(0.1)
-        n = int((time.time() - self.t0) * FS) - self.k
+        n = int((time.time() - self.w0) * FS) - self.k
         t = (self.k + np.arange(n)) / FS; self.k += n
         x = self.rng.normal(0, 8, (n, N_EEG))
         closed = ((t // 20) % 2 == 1) if not self.check else ((t > 25) & (t < 45))
@@ -271,6 +331,12 @@ def device_check(src, out: Path):
     print("\a", end="")
     blk = collect(10, "EYES OPEN, now BLINK FIRMLY 5 times, about 2 s apart")
 
+    for seg, name, sec in ((opn, "eyes open", 20), (cls, "eyes closed", 20), (blk, "blinks", 10)):
+        if len(seg) < 0.8 * sec * FS:
+            print(f"\n❌ NO DATA: got {len(seg)} samples during '{name}' (expected ~{sec * FS}).\n"
+                  "   The headset isn't streaming. Check it's ON, close Unicorn Suite / other laptops,\n"
+                  "   keep the Mac within 1 m, then run 1) again.")
+            return False
     sos = butter(4, [1, 40], btype="band", fs=FS, output="sos")
     b, a = iirnotch(50, 30, fs=FS); sos = np.vstack([sos, tf2sos(b, a)])
     filt = lambda x: sosfiltfilt(sos, x - np.median(x, 0), axis=0)[int(FS):-int(FS)]
@@ -363,15 +429,19 @@ def main():
     raw_q = collections.deque(maxlen=5000)   # raw samples for the live pipeline board
     stop = threading.Event()
 
+    markers = MarkerListener()
+
     def acquire():
-        n, last_print, pending = 0, time.time(), []
+        n, last_print, pending, n_mk = 0, time.time(), [], 0
         while not stop.is_set():
             try:
                 x, ts, mks = src.read()
             except Exception as e:
                 print(f"\n[source] headset disconnected / read error: {e}\n[source] stopping. Data so far is saved; rerun to continue.")
                 stop.set(); break
-            pending += mks
+            new = mks + markers.poll()
+            if new:
+                pending = sorted(pending + new); n_mk += len(new)
             for row, t in zip(x, ts):
                 m = ""
                 while pending and pending[0][0] <= t:      # attach marker to nearest following sample
@@ -386,7 +456,7 @@ def main():
                 f = latest["f"]; last_print = time.time(); fh.flush()
                 q = " ".join(f"{c}:{'ok' if s == 'good' else s[:5]:5s}" for c, s in zip(CH, f["quality"]))
                 pa = f["summary"]["posterior_alpha_rel"]
-                print(f"\r{n / FS:6.0f}s  good {f['summary']['n_good']}/8  postα {pa if pa is None else round(pa, 2)}  "
+                print(f"\r{n / FS:6.0f}s  mk {n_mk:3d}  good {f['summary']['n_good']}/8  postα {pa if pa is None else round(pa, 2)}  "
                       f"σ(µV) {f['std_uv']}  {q}", end="", flush=True)
         fh.flush()
 
@@ -437,19 +507,28 @@ def main():
                         except Exception:
                             clients.discard(c)
 
+    def keep_recording():
+        while th.is_alive():
+            time.sleep(0.5)
+
     try:
         if a.no_ws:
-            while th.is_alive():
-                time.sleep(0.5)
+            keep_recording()
         else:
-            asyncio.run(serve())
+            try:
+                asyncio.run(serve())
+            except OSError as e:   # dashboard port busy (old stream still running?) -> NEVER stop recording
+                print(f"\n[ws] dashboards OFF: {e}\n[ws] recording continues. Close other streams to get dashboards back.",
+                      flush=True)
+                keep_recording()
     except KeyboardInterrupt:
         pass
     finally:
-        stop.set(); th.join(timeout=2); fh.close()
+        stop.set(); th.join(timeout=2); fh.flush(); fh.close()
         if hasattr(src, "close"):
             src.close()
-        print(f"\n[record] saved {path.resolve()}")
+        print(f"\n[record] saved {path.resolve()}", flush=True)
+        os._exit(0)   # LSL background threads can otherwise keep the process alive after Ctrl+C
 
 
 if __name__ == "__main__":
