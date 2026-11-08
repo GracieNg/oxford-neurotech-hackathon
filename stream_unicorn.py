@@ -122,16 +122,22 @@ class SerialSource:
     UV = 4500000.0 / 50331642.0
 
     @classmethod
-    def _probe(cls, serial, port, wait=6.0):
-        """Open the port, send START, return the open Serial if bytes arrive within `wait` s, else None."""
+    def _probe(cls, serial, port, wait=15.0):
+        """Open the port, send START (re-sent every 4 s), return the open Serial if bytes arrive within `wait` s."""
         try:
             s = serial.Serial(port, 115200, timeout=0.5)
             s.reset_input_buffer()
+            s.write(cls.STOP)          # clear a stream left running by a crashed session
+            time.sleep(0.3)
+            s.reset_input_buffer()
             s.write(cls.START)
-            t0 = time.time()
+            t0 = last = time.time()
             while time.time() - t0 < wait:
                 if s.read(cls.FRAME):
                     return s
+                if time.time() - last > 4:
+                    print(f"[source]   still waiting for {port} ({int(time.time() - t0)} s)…", flush=True)
+                    s.write(cls.START); last = time.time()
             try:
                 s.write(cls.STOP)
             except Exception:
@@ -343,8 +349,12 @@ def device_check(src, out: Path):
     yo, yc, yb = filt(opn), filt(cls), filt(blk)
 
     def alpha(y):
-        f, p = welch(y.T, fs=FS, nperseg=int(2 * FS))
+        f, p = welch(y.T, fs=FS, nperseg=int(2 * FS), average="median")  # robust to movement bursts
         return p[:, (f >= 8) & (f < 13)].mean(1)
+
+    def mains_mv(x):  # 50 Hz amplitude in the RAW signal (before the notch), mV
+        f, p = welch((x - x.mean(0)).T, fs=FS, nperseg=int(2 * FS), average="median")
+        return np.sqrt(2 * p[:, np.argmin(np.abs(f - 50))] * (f[1] - f[0])) / 1000
 
     sd = np.median(yo[:len(yo) // int(FS) * int(FS)].reshape(-1, int(FS), N_EEG).std(1), 0)
     ratio = alpha(yc) / np.maximum(alpha(yo), 1e-12)
@@ -354,14 +364,20 @@ def device_check(src, out: Path):
     above = np.flatnonzero(fz > thr)
     blinks = int((np.diff(above) > FS * 0.4).sum() + (1 if len(above) else 0))
 
-    ok_ch = [(2 <= s <= 60) for s in sd]
+    mains = mains_mv(opn)
+    ok_ch = [(2 <= s <= 60) and m < 1.0 for s, m in zip(sd, mains)]
     alpha_ok = np.median(ratio[post]) >= 1.3
     blink_ok = 3 <= blinks <= 8
     print("\n=== RESULTS ===")
-    print(f"{'ch':4s} {'σ µV (eyes open)':>17s} {'α closed/open':>14s}  status")
+    print(f"{'ch':4s} {'σ µV (eyes open)':>17s} {'50 Hz mV':>9s} {'α closed/open':>14s}  status")
     for i, c in enumerate(CH):
-        print(f"{c:4s} {sd[i]:17.1f} {ratio[i]:14.2f}  {'OK' if ok_ch[i] else ('FLAT' if sd[i] < 2 else 'NOISY: re-seat/wet electrode')}")
-    print(f"\nSignal amplitude : {sum(ok_ch)}/8 channels in 2-60 µV          {'PASS' if sum(ok_ch) >= 7 else 'FAIL'}")
+        st = ("OK" if ok_ch[i] else "MAINS HUM: poor contact / reference" if mains[i] >= 1.0
+              else "FLAT" if sd[i] < 2 else "NOISY: re-seat/wet electrode")
+        print(f"{c:4s} {sd[i]:17.1f} {mains[i]:9.2f} {ratio[i]:14.2f}  {st}")
+    if np.median(mains) >= 1.0:
+        print("\n⚡ Mains hum on most channels → re-stick the REFERENCE/GROUND electrodes behind the ears,\n"
+              "   unplug the Mac charger, move away from power strips/monitors.")
+    print(f"\nSignal amplitude : {sum(ok_ch)}/8 channels in 2-60 µV, low hum {'PASS' if sum(ok_ch) >= 7 else 'FAIL'}")
     print(f"Eyes-closed alpha: posterior ×{np.median(ratio[post]):.2f} (need ≥1.3)        {'PASS' if alpha_ok else 'FAIL'}")
     print(f"Blink detection  : {blinks} blinks seen on Fz (asked for 5)     {'PASS' if blink_ok else 'CHECK'}")
     verdict = sum(ok_ch) >= 7 and alpha_ok
