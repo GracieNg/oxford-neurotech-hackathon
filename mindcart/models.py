@@ -33,7 +33,8 @@ META_CAT = ["category", "colour"]
 
 def load_prefs(sdir: Path):
     """prefs.csv: type,value,score  e.g.  category,jacket,4  /  colour,black,5  (asked BEFORE the session)."""
-    p = sdir / "prefs.csv"
+    from mindcart.erp import out_dir
+    p = out_dir(sdir) / "prefs.csv"
     if not p.exists():
         return {}, {}
     df = pd.read_csv(p)
@@ -42,7 +43,8 @@ def load_prefs(sdir: Path):
 
 
 def build_table(sdir: Path, items: pd.DataFrame, use_full=False):
-    tr = pd.read_csv(sdir / "trials.csv")
+    from mindcart.erp import out_dir
+    tr = pd.read_csv(out_dir(sdir) / "trials.csv")
     tr = tr[tr["ok"] & tr["label"].notna()].copy()
     tr["item_id"] = tr["item_id"].astype(str)
     it = items.copy(); it["item_id"] = it["item_id"].astype(str)
@@ -57,6 +59,7 @@ def build_table(sdir: Path, items: pd.DataFrame, use_full=False):
             Xa = pd.concat([Xa, pd.get_dummies(df[c].astype(str), prefix=c, dtype=float)], axis=1)
     eeg_cols = [c for c in df if c.startswith("full_" if use_full else "f_")]
     Xb = df[eeg_cols].astype(float)
+    build_table.trial_order = df["trial"].to_numpy()
     return Xa.to_numpy(), Xb.to_numpy(), df["label"].astype(int).to_numpy(), list(Xa.columns), eeg_cols
 
 
@@ -79,10 +82,30 @@ def cv_scores(X, y, model, n_rep=10, seed=0):
     return bacc, f1
 
 
+def temporal_split(X, y, order):
+    """Sensitivity check vs slow drift/fatigue: train on the first half (before the break), test on the
+    second half, and vice versa. Neighbouring trials never end up on both sides. Returns mean balanced accuracy."""
+    half = np.median(order)
+    a, b = order < half, order >= half
+    accs = []
+    for tr, te in ((a, b), (b, a)):
+        if len(np.unique(y[tr])) < 2 or len(np.unique(y[te])) < 2:
+            continue
+        m = clf().fit(X[tr], y[tr]); accs.append(balanced_accuracy_score(y[te], m.predict(X[te])))
+    return float(np.mean(accs)) if accs else np.nan
+
+
 def evaluate_participant(sdir, items, n_perm=500, use_full=False):
     Xa, Xb, y, a_cols, b_cols = build_table(Path(sdir), items, use_full)
+    order = build_table.trial_order
     sets = {"A_product": Xa, "B_EEG": Xb, "C_combined": np.hstack([Xa, Xb])}
-    res = {"participant": Path(sdir).name, "n_trials": len(y), "n_like": int(y.sum()),
+    # EXPLORATORY (not in ANALYSIS_PLAN.md): which part of B carries the signal?
+    erp_idx = [i for i, c in enumerate(b_cols) if c.startswith(("f_p300", "f_lpp"))]
+    band_idx = [i for i in range(len(b_cols)) if i not in erp_idx]
+    if erp_idx and band_idx:
+        sets["Bx_band"] = Xb[:, band_idx]
+        sets["Bx_erp"] = Xb[:, erp_idx]
+    res = {"participant": Path(sdir).stem, "n_trials": len(y), "n_like": int(y.sum()),
            "majority_bacc": 0.5, "majority_acc": float(max(y.mean(), 1 - y.mean()))}
     per_rep = {}
     for name, X in sets.items():
@@ -95,6 +118,7 @@ def evaluate_participant(sdir, items, n_perm=500, use_full=False):
         k = int(min(5, np.bincount(y).min()))
         score, perm, p = permutation_test_score(clf(), X, y, cv=StratifiedKFold(k, shuffle=True, random_state=0),
                                                 scoring="balanced_accuracy", n_permutations=n_perm, random_state=0)
+        res[f"{name}_halfsplit"] = temporal_split(X, y, order)
         res.update({f"{name}_bacc": sc[0].mean(), f"{name}_bacc_sd": sc[0].std(), f"{name}_f1": sc[1].mean(),
                     f"{name}_p": p, f"{name}_chance95": float(np.percentile(perm, 95)), f"{name}_nfeat": X.shape[1]})
     if "A_product" in per_rep and "C_combined" in per_rep:
@@ -136,13 +160,19 @@ def main():
     items = pd.read_csv(a.items)
     results = [evaluate_participant(s, items, a.n_perm, a.full) for s in a.session_dirs]
     df = pd.DataFrame(results)
-    out = Path(a.session_dirs[0]).parent
+    from mindcart.erp import out_dir
+    out = out_dir(a.session_dirs[0]).parent
     df.to_csv(out / "results.csv", index=False)
     plot(results, out / "results.png")
     pd.set_option("display.width", 200)
-    cols = ["participant", "n_trials"] + [c for c in df if c.endswith("_bacc") or c.endswith("_p")] + \
+    cols = ["participant", "n_trials"] + [c for c in df if c.endswith("_bacc") or c.endswith("_p") or c.endswith("_halfsplit")] + \
            [c for c in ("C_minus_A", "C_beats_A_frac") if c in df]
-    print(df[cols].round(3).to_string(index=False))
+    main = [c for c in cols if not c.startswith("Bx_")]
+    print(df[main].round(3).to_string(index=False))
+    ex = ["participant"] + [c for c in cols if c.startswith("Bx_")]
+    if len(ex) > 1:
+        print("\nEXPLORATORY (not pre-registered): EEG split into band power (8) vs ERP (4)")
+        print(df[ex].round(3).to_string(index=False))
     print(f"\nSaved {out / 'results.csv'} and {out / 'results.png'}")
 
 

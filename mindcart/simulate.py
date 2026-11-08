@@ -56,8 +56,9 @@ def simulate_participant(items, sdir, rng, effect):
     idio = rng.standard_normal(len(order))
     latent = 0.35 * (pref - pref.mean()) / pref.std() - 0.2 * (items.price.values[order] - 65) / 30 + 0.9 * idio
     rating = np.clip(np.round(3 + 1.3 * latent + rng.normal(0, 0.4, len(order))), 1, 5).astype(int)
+    need = np.clip(np.round(2.6 + 0.4 * latent + rng.normal(0, 1.1, len(order))), 1, 5).astype(int)
 
-    trial_s = 1.0 + 4.0 + 1.5 + 0.7
+    trial_s = 1.0 + 4.0 + 2.5 + 0.7
     n = int((len(order) * trial_s + 10) * FS)
     x = 8.0 * pink(n, rng, len(CH))
     t = np.arange(n) / FS + 1000.0  # fake LSL clock
@@ -85,6 +86,7 @@ def simulate_participant(items, sdir, rng, effect):
             b = on + int(rng.uniform(0.6, 3.5) * FS); x[b:b + 60, 0] += 300 * np.hanning(60)
         rt = round(float(rng.uniform(0.6, 1.6)), 3)
         markers.append((f"rate|{k}|{items.item_id[i]}|{rating[k]}|{rt}", t[off] + rt))
+        markers.append((f"need|{k}|{items.item_id[i]}|{need[k]}|{rt}", t[off] + rt + 1.0))
         cur += trial_s + rng.uniform(-0.2, 0.2)
     markers.append(("end", t[int(cur * FS)]))
     x += rng.normal(0, 3000, len(CH))  # DC offsets
@@ -92,6 +94,17 @@ def simulate_participant(items, sdir, rng, effect):
         .to_csv(sdir / "eeg.csv", index=False, float_format="%.4f")
     pd.DataFrame(markers, columns=["marker", "lsl_time"])[["lsl_time", "marker"]].to_csv(sdir / "markers.csv", index=False)
     return rating
+
+
+def to_single_file(sdir, path):
+    """Convert a simulated session folder into stream_unicorn.py's one-file format (markers on samples)."""
+    eeg = pd.read_csv(sdir / "eeg.csv"); mk = pd.read_csv(sdir / "markers.csv")
+    col = [""] * len(eeg); t = eeg["lsl_time"].to_numpy()
+    for lt, m in zip(mk["lsl_time"], mk["marker"]):
+        i = min(int(np.searchsorted(t, lt)), len(t) - 1)
+        col[i] = (col[i] + ";" if col[i] else "") + m
+    eeg["marker"] = col
+    eeg.to_csv(path, index=False, float_format="%.4f")
 
 
 def simulate_oddball(sdir, rng, n=200, p_target=0.2, p300_uv=6.0):
@@ -124,6 +137,7 @@ def main():
     ap.add_argument("--effect", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--oddball", action="store_true", help="simulate an oddball P300 validation session instead")
+    ap.add_argument("--single-file", action="store_true", help="also write each session as one stream_unicorn.py CSV")
     a = ap.parse_args()
     rng = np.random.default_rng(a.seed)
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
@@ -134,6 +148,8 @@ def main():
     items = make_items(a.n_items, rng); items.to_csv(out / "items.csv", index=False)
     for p in range(a.participants):
         r = simulate_participant(items, out / f"P{p + 1:02d}", rng, a.effect)
+        if a.single_file:
+            to_single_file(out / f"P{p + 1:02d}", out / f"P{p + 1:02d}_stream.csv")
         print(f"P{p + 1:02d}: ratings {np.bincount(r, minlength=6)[1:]} (counts of 1..5)")
     print(f"Wrote {out}/items.csv and {a.participants} sessions")
 

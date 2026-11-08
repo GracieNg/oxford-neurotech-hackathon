@@ -6,6 +6,8 @@ can't drive EEG differences. Brightness/colourfulness are saved so Model A can u
     python -m mindcart.prep_images stimuli/raw stimuli/items.csv --out stimuli/norm
 
 items.csv must have at least: item_id,file   (optional: category,colour,price,style)
+If items.csv does not exist it is CREATED from the images in raw_dir (item_id = I001, I002 ...),
+so you can just drop outfit photos in a folder and run this.
 Writes stimuli/norm/<item_id>.png and adds columns luminance,contrast,colourfulness.
 """
 import argparse
@@ -44,6 +46,14 @@ def main():
     ap.add_argument("--out", default="stimuli/norm")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    if not Path(a.items_csv).exists():
+        imgs = sorted(f.name for f in Path(a.raw_dir).iterdir()
+                      if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and not f.name.startswith("."))
+        if not imgs:
+            raise SystemExit(f"No images found in {a.raw_dir}")
+        Path(a.items_csv).parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"item_id": [f"I{i + 1:03d}" for i in range(len(imgs))], "file": imgs}).to_csv(a.items_csv, index=False)
+        print(f"Created {a.items_csv} with {len(imgs)} items (add category/colour/price columns if you have them)")
     items = pd.read_csv(a.items_csv)
     feats = []
     for _, r in items.iterrows():

@@ -1,7 +1,8 @@
 """MindCart viewing task (PsychoPy). Sends LSL markers for every event.
 
-Trial: fixation 1 s -> product image 4 s -> "How interested are you? 1-5" (keys 1-5)
+Trial: fixation 1 s -> outfit image 4 s -> "WANT it?" 1-5 -> "NEED it?" 1-5
        -> jittered blank 0.5-0.9 s. Break screen halfway. Esc quits safely.
+Impulse = high WANT + low NEED (what UnSway nudges on).
 
     python mindcart/experiment.py --pid P01 --items stimuli/items.csv --img-dir stimuli/norm
     python mindcart/experiment.py --pid TEST --n 5 --windowed     # 5-trial sync check
@@ -11,7 +12,7 @@ Oddball: blue circles (80%) and rare orange squares (20%), 200 ms each, every 0.
 The participant silently counts the orange squares. Targets should give a clear P300 at Pz.
 
 Markers (string, one per event):
-  start | fix|<trial> | img|<trial>|<item_id> | rate|<trial>|<item_id>|<rating>|<rt> | break | end
+  start | fix|<trial> | img|<trial>|<item_id> | rate|<trial>|<item_id>|<want>|<rt> | need|<trial>|<item_id>|<need>|<rt> | break | end
   oddball: odd|<trial>|target  /  odd|<trial>|standard
 Also writes sessions/<pid>/behaviour.csv as a backup.
 """
@@ -54,14 +55,16 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     beh = open(out / "behaviour.csv", "w", newline="")
     bw = csv.writer(beh)
-    bw.writerow(["trial", "item_id", "onset_lsl", "rating", "rt"])
+    bw.writerow(["trial", "item_id", "onset_lsl", "want", "want_rt", "need", "need_rt"])
 
     win = visual.Window(size=(1280, 800) if a.windowed else None, fullscr=not a.windowed,
                         color=(0, 0, 0), units="height")  # mid-grey, matches image background
     fix = visual.TextStim(win, "+", height=0.08, color="white")
     msg = visual.TextStim(win, "", height=0.04, color="white", wrapWidth=1.2)
-    rate = visual.TextStim(win, "How interested are you in this item?\n\n1   2   3   4   5\n\n"
-                                "(1 = not at all, 5 = very)", height=0.045, color="white")
+    q_want = visual.TextStim(win, "How much do you WANT it?\n\n1   2   3   4   5\n\n"
+                                  "(1 = not at all, 5 = I'd buy it now)", height=0.045, color="white")
+    q_need = visual.TextStim(win, "How much do you NEED it?\n\n1   2   3   4   5\n\n"
+                                  "(1 = not at all, 5 = I really need it)", height=0.045, color="white")
     img = visual.ImageStim(win, size=(0.8, 0.8))
 
     def mark(s):
@@ -79,7 +82,8 @@ def main():
 
     show_msg("Look at each clothing item while keeping still and relaxed.\n"
              "Try not to blink while the item is on screen.\n\n"
-             "Then rate how interested you are (keys 1-5).\n\nPress SPACE to start.")
+             "Then answer two quick questions with keys 1-5:\nhow much you WANT it, and how much you NEED it.\n"
+             "Go with your gut, there are no right answers.\n\nPress SPACE to start.")
     core.wait(1.0)  # give the recorder a moment
     mark("start")
     half = len(items) // 2
@@ -97,14 +101,19 @@ def main():
         win.callOnFlip(lambda: onset.setdefault("t", local_clock()))
         win.callOnFlip(mark, f"img|{t}|{it['item_id']}")
         win.flip(); core.wait(IMG_S)
-        # rating
-        rate.draw(); win.flip(); clock.reset(); event.clearEvents()
-        keys = event.waitKeys(maxWait=RATE_MAX_S, keyList=list("12345") + ["escape"], timeStamped=clock)
-        if keys and keys[0][0] == "escape":
-            quit_()
-        r, rt = (int(keys[0][0]), round(keys[0][1], 3)) if keys else ("", "")
-        mark(f"rate|{t}|{it['item_id']}|{r}|{rt}")
-        bw.writerow([t, it["item_id"], f"{onset.get('t', 0):.6f}", r, rt]); beh.flush()
+        # ratings: WANT then NEED
+        def ask(stim):
+            stim.draw(); win.flip(); clock.reset(); event.clearEvents()
+            keys = event.waitKeys(maxWait=RATE_MAX_S, keyList=list("12345") + ["escape"], timeStamped=clock)
+            if keys and keys[0][0] == "escape":
+                quit_()
+            return (int(keys[0][0]), round(keys[0][1], 3)) if keys else ("", "")
+        w, wrt = ask(q_want)
+        mark(f"rate|{t}|{it['item_id']}|{w}|{wrt}")
+        win.flip(); core.wait(0.2)
+        n, nrt = ask(q_need)
+        mark(f"need|{t}|{it['item_id']}|{n}|{nrt}")
+        bw.writerow([t, it["item_id"], f"{onset.get('t', 0):.6f}", w, wrt, n, nrt]); beh.flush()
         win.flip(); core.wait(rng.uniform(0.5, 0.9))
     show_msg("Done, thank you!\n\nPress SPACE to finish.")
     quit_()

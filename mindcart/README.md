@@ -2,6 +2,38 @@
 
 **Question:** does EEG improve clothing-preference prediction over product data alone?
 
+## TONIGHT: the exact run order (Mac + Unicorn over Bluetooth)
+
+```bash
+# 0. once
+pip3 install numpy scipy pandas pillow scikit-learn matplotlib pylsl websockets pyserial psychopy
+# 1. outfits: from the PowerPoint board (or drop 60-80 photos in stimuli/raw/ yourself)
+python3 -m mindcart.pptx_to_stimuli ~/Downloads/Grace_Fashion_Board.pptx --out stimuli/raw
+python3 -m mindcart.prep_images stimuli/raw stimuli/items.csv --out stimuli/norm   # auto-creates items.csv
+# 2. headset check (eyes open, eyes closed, blinks) -> must say READY
+python3 stream_unicorn.py --check
+# 3. ERP check, ~4 min.  Terminal 1:
+python3 stream_unicorn.py --name OB01.csv
+#                         Terminal 2:
+python3 mindcart/experiment.py --pid OB01 --oddball
+python3 -m mindcart.erp recordings/OB01.csv --oddball      # PASS = markers + ERPs work
+# 4. each participant, ~12 min.  Terminal 1:
+python3 stream_unicorn.py --name P01.csv
+#                         Terminal 2:
+python3 mindcart/experiment.py --pid P01 --items stimuli/items.csv --img-dir stimuli/norm
+# 5. analysis (all participants at once)
+python3 -m mindcart.features recordings/P01.csv recordings/P02.csv
+python3 -m mindcart.erp      recordings/P01.csv recordings/P02.csv
+python3 -m mindcart.models   recordings/P01.csv recordings/P02.csv --items stimuli/items.csv
+```
+
+- `stream_unicorn.py` writes EEG **and** the experiment's markers into ONE file, so there's no separate recorder.
+- Results land in `recordings/P01/` (trials.csv, erp_want.png) and `recordings/results.png`.
+- Ratings: **WANT** (1–5) then **NEED** (1–5). Main analysis = predict WANT from the brain.
+  UnSway rule = brain-predicted WANT + low stated NEED → nudge. `--label impulse` (want ≥ 4 & need ≤ 2) is
+  exploratory, because it leaves only about 10 positive trials per person.
+- Go/no-go at about 4 AM: oddball PASS and at least 2 participants recorded → use this. Otherwise fall back to the dashboard.
+
 ## 0. Setup (once)
 
 ```bash
@@ -66,7 +98,7 @@ This gives `sessions/results.csv` and `sessions/results.png`, which is the slide
 - **Artefacts:** trials with more than 200 µV peak-to-peak in the analysis window are dropped (`--ptp`).
 - **ERP features (P300 + LPP):** filtered 0.1–30 Hz (slow waves survive), epochs −200 to 1000 ms around image onset, baseline −200 to 0 ms, epochs over ±100 µV at Fz/Cz/Pz rejected.
   - `f_p300_pz`, `f_p300_cz`: mean 250–500 ms. Attention, "this caught my eye".
-  - `f_lpp_pz`, `f_lpp_cpz`: mean 500–1000 ms. Sustained motivational significance (interest or liking).
+  - `f_lpp_pz`, `f_lpp_czpz`: mean 500–1000 ms. Sustained motivational significance (interest or liking).
   - Rejected epochs get NaN and are imputed inside each CV training fold.
 - **ERP plot:** `python -m mindcart.erp sessions/P01` gives `sessions/P01/erp.png` (liked vs not liked at Pz and Cz).
 
