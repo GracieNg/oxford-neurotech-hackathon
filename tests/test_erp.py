@@ -16,7 +16,7 @@ def test_epoch_baseline_and_window_means():
     assert ok[0] and ep.shape == (1, 300, 8)
     f = erp_features(ep, times, ok)
     assert f["f_p300_pz"][0] > 3 and abs(f["f_p300_cz"][0]) < 1e-9
-    assert f["f_lpp_cpz"][0] > 0.5
+    assert f["f_lpp_czpz"][0] > 0.5
 
 
 def test_artefact_epoch_rejected():
