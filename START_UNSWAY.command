@@ -66,6 +66,8 @@ open_dashboards() {
   open_url "file://$DIR/dashboard/pipeline.html?ws=ws://localhost:8766"
   sleep 0.5
   open_url "file://$DIR/dashboard/mindcart.html?ws=ws://localhost:8765"
+  sleep 0.5
+  open_url "file://$DIR/dashboard/brainwaves.html?ws=ws://localhost:8766"
   ok "Dashboards open in Chrome (pipeline board + UnSway)"
 }
 

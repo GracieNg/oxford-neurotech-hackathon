@@ -365,16 +365,17 @@ def device_check(src, out: Path):
     blinks = int((np.diff(above) > FS * 0.4).sum() + (1 if len(above) else 0))
 
     mains = mains_mv(opn)
-    ok_ch = [(2 <= s <= 60) and m < 1.0 for s, m in zip(sd, mains)]
+    ok_ch = [(2 <= s <= 60) and m < 5.0 for s, m in zip(sd, mains)]   # <5 mV hum: the 50 Hz notch removes it
     alpha_ok = np.median(ratio[post]) >= 1.3
     blink_ok = 3 <= blinks <= 8
     print("\n=== RESULTS ===")
     print(f"{'ch':4s} {'σ µV (eyes open)':>17s} {'50 Hz mV':>9s} {'α closed/open':>14s}  status")
     for i, c in enumerate(CH):
-        st = ("OK" if ok_ch[i] else "MAINS HUM: poor contact / reference" if mains[i] >= 1.0
+        st = (("OK" if mains[i] < 1.0 else "OK (some hum, filtered out)") if ok_ch[i]
+              else "MAINS HUM: poor contact / reference" if mains[i] >= 5.0
               else "FLAT" if sd[i] < 2 else "NOISY: re-seat/wet electrode")
         print(f"{c:4s} {sd[i]:17.1f} {mains[i]:9.2f} {ratio[i]:14.2f}  {st}")
-    if np.median(mains) >= 1.0:
+    if np.median(mains) >= 5.0:
         print("\n⚡ Mains hum on most channels → re-stick the REFERENCE/GROUND electrodes behind the ears,\n"
               "   unplug the Mac charger, move away from power strips/monitors.")
     print(f"\nSignal amplitude : {sum(ok_ch)}/8 channels in 2-60 µV, low hum {'PASS' if sum(ok_ch) >= 7 else 'FAIL'}")
